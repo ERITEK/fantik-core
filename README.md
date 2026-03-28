@@ -12,7 +12,8 @@
 
 Криптографическое ядро для обфускации (TCP с оговорками) и UDP трафика. 
 Оборачивает пакеты любого протокола (WireGuard, OpenVPN, AmneziaWG и др.) в AEAD-шифрованную оболочку.
-На проводе чистый шум ни одного фиксированного байта, ни одной распознаваемой структуры.
+На проводе результат выглядит как поток случайных байт - нет фиксированных заголовков, magic bytes или предсказуемых длин. 
+Это не делает трафик невидимым, но убирает все очевидные сигнатуры протокола.
 
 ## Что существует в этой нише
 
@@ -105,7 +106,7 @@ Nonce = 12 случайных байт. Ciphertext = зашифрованный 
 [Version 1B][SessionID 8B][Seq 8B][Flags 1B][PayloadLen 2B][Payload 0..N][Cover 0..M]
 ```
 
-- **Version** - версия wire format (0x02)
+- **Version** - версия wire format (0x01)
 - **SessionID** - идентификатор сессии (crypto/rand, генерируется клиентом)
 - **Seq** - порядковый номер (с 1, per-direction)
 - **Flags** - тип пакета (Data, Keepalive, KeepaliveAck, Close)
@@ -328,6 +329,23 @@ Fantik Core компилируется под MIPS/ARM (OpenWrt), потребл
 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -o fantik-client ./cmd/client/
 ```
 
+### Что Fantik Core НЕ делает
+
+- Нет forward secrecy (PFS) - это PSK-обфускатор, не замена TLS. Если PSK утёк - весь трафик скомпрометирован. Upstream протокол (WireGuard и т.д.) обеспечивает PFS самостоятельно
+- Нет handshake - клиент и сервер не договариваются о параметрах, всё из PSK
+- Нет key rotation - ротация ключей ответственность прикладного кода (ротация SessionID встроена, ротация PSK - нет)
+- Нет защиты от traffic analysis - тайминг, burst patterns, объём трафика, корреляция по времени - всё это видно наблюдателю. Fantik скрывает содержимое и протокол, но не факт передачи данных
+- Rate limiting и flood protection не встроены - это ответственность прикладного кода. В UDPServer есть OnNewSession callback для этого
+
+### Key usage limits
+
+При random 96-bit nonce birthday bound наступает при ~2^48 пакетов на одном ключе. Встроенный лимит session (2^30 пакетов, ~1 млрд) даёт запас в 18 порядков. Вероятность коллизии nonce при 2^30 пакетов - примерно 2^-36 (один шанс на ~70 миллиардов).
+
+Рекомендации:
+- Ротация SessionID происходит автоматически при достижении MaxSessionPackets
+- PSK менять вручную при подозрении на компрометацию
+- Для параноиков: XChaCha20-Poly1305 (192-bit nonce) убирает вопрос коллизий полностью - миграция запланирована
+
 ## Overhead
 
 | Компонент | UDP | TCP |
@@ -383,6 +401,25 @@ go test ./... -v
 - TCP: одно соединение = single point of failure (решение: reconnect, fallback, transport = auto)
 - Высокая энтропия без TLS handshake --> DPI может флагировать (решается mimicry)
 - Flow fingerprinting (тайминг, burst) --> не решается без traffic shaping
+
+## Модель угроз
+
+### От чего защищает
+
+- Сигнатурный DPI, который ищет заголовки VPN протоколов (WireGuard handshake initiation, OpenVPN opcode и т.д.)
+- Блокировка по фиксированным magic bytes
+- Анализ длин пакетов (cover bytes рандомизируют размеры)
+- Replay-атаки (sliding window 2048)
+- TCP: блокировка по length prefix pattern (EncLen маскирован HMAC, не static mask как в Shadowsocks AEAD)
+
+### От чего НЕ защищает
+
+- ML-DPI и statistical analysis (поведение трафика, burst patterns, timing correlation)
+- Блокировка по политике "всё что не TLS/HTTP - дропать" (нужен mimicry, TLS-like handshake)
+- Компрометация PSK (нет PFS, нет key exchange)
+- Traffic volume correlation ("VPN включён = трафик на VPS скакнул")
+- Active probing (сервер отвечает на мусор тишиной, но DPI может это использовать)
+- Censorship-resistant discovery (как найти сервер если IP заблокирован)
 
 ## Лицензия
 
